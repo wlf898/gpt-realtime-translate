@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport"
+        content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>GPT 实时同声传译</title>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      background: #f5f5f5;
+      color: #111;
+    }
+
+    main {
+      max-width: 720px;
+      margin: auto;
+      padding: 18px;
+    }
+
+    h1 {
+      font-size: 26px;
+      margin-bottom: 8px;
+    }
+
+    .tip {
+      color: #666;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .card {
+      background: white;
+      border-radius: 18px;
+      padding: 16px;
+      margin-top: 14px;
+      box-shadow: 0 2px 12px #00000012;
+    }
+
+    label {
+      display: block;
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    select, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 15px;
+      margin-top: 8px;
+      border-radius: 12px;
+      font-size: 18px;
+    }
+
+    select {
+      background: white;
+      border: 1px solid #ccc;
+    }
+
+    button {
+      border: 0;
+      background: #111;
+      color: white;
+      font-weight: 700;
+    }
+
+    button.stop {
+      background: #b3261e;
+    }
+
+    button:disabled {
+      opacity: .45;
+    }
+
+    #status {
+      margin-top: 14px;
+      font-weight: 700;
+    }
+
+    #transcript {
+      min-height: 160px;
+      white-space: pre-wrap;
+      font-size: 21px;
+      line-height: 1.6;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+
+<body>
+<main>
+
+  <h1>GPT 实时同声传译</h1>
+
+  <div class="tip">
+    只翻译，不回答问题，不解释，不重复原文。
+  </div>
+
+  <div class="card">
+
+    <label for="lang">翻译成：</label>
+
+    <select id="lang">
+      <option value="zh">中文</option>
+      <option value="ku">库尔德语 Kurdish</option>
+      <option value="en">英语 English</option>
+      <option value="ru">俄语 Russian</option>
+      <option value="tr">土耳其语 Turkish</option>
+      <option value="ar">阿拉伯语 Arabic</option>
+    </select>
+
+    <button id="start">
+      开始同声传译
+    </button>
+
+    <button id="stop"
+            class="stop"
+            disabled>
+      停止
+    </button>
+
+    <div id="status">
+      未连接
+    </div>
+
+    <div class="tip">
+      对方讲话时选择“中文”；你讲中文时选择对方的语言。
+    </div>
+
+  </div>
+
+  <div class="card">
+
+    <strong>实时译文</strong>
+
+    <div id="transcript"></div>
+
+  </div>
+
+  <audio id="remoteAudio"
+         autoplay></audio>
+
+</main>
+
+<script>
+
+let pc = null;
+let dc = null;
+let localStream = null;
+
+const $ = id => document.getElementById(id);
+
+function setStatus(text) {
+  $("status").textContent = text;
+}
+
+async function stopTranslation() {
+
+  try {
+    if (dc) dc.close();
+    if (pc) pc.close();
+
+    if (localStream) {
+      localStream
+        .getTracks()
+        .forEach(track => track.stop());
+    }
+  } catch (e) {}
+
+  pc = null;
+  dc = null;
+  localStream = null;
+
+  $("start").disabled = false;
+  $("stop").disabled = true;
+
+  setStatus("已停止");
+}
+
+
+async function startTranslation() {
+
+  await stopTranslation();
+
+  $("transcript").textContent = "";
+
+  $("start").disabled = true;
+  $("stop").disabled = false;
+
+  setStatus("正在连接 GPT 实时翻译……");
+
+  try {
+
+    /*
+      向我们自己的服务器申请
+      OpenAI 临时 Client Secret
+    */
+
+    const response = await fetch("/session", {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json"
+      },
+
+      body: JSON.stringify({
+        targetLanguage: $("lang").value
+      })
+    });
+
+
+    const session = await response.json();
+
+    if (!response.ok) {
+
+      throw new Error(
+        session?.error?.message ||
+        session?.error ||
+        JSON.stringify(session)
+      );
+    }
+
+
+    const token = session.value;
+
+    if (!token) {
+      throw new Error("服务器没有返回临时密钥");
+    }
+
+
+    /*
+      建立 WebRTC
+    */
+
+    pc = new RTCPeerConnection();
+
+
+    /*
+      OpenAI 返回的翻译语音
+      直接送到手机扬声器
+    */
+
+    pc.ontrack = event => {
+
+      $("remoteAudio").srcObject =
+        event.streams[0];
+
+    };
+
+
+    /*
+      接收实时事件和字幕
+    */
+
+    dc = pc.createDataChannel("oai-events");
+
+
+    dc.onopen = () => {
+
+      setStatus(
+        "已连接，可以开始讲话"
+      );
+
+    };
+
+
+    dc.onmessage = event => {
+
+      let data;
+
+      try {
+
+        data = JSON.parse(event.data);
+
+      } catch {
+
+        return;
+
+      }
+
+
+      /*
+        尽量兼容不同实时翻译事件
+      */
+
+      const delta =
+        data.delta ||
+        data.transcript_delta ||
+        data.text_delta;
+
+
+      if (typeof delta === "string") {
+
+        $("transcript").textContent += delta;
+
+      }
+
+
+      if (
+        data.type &&
+        data.type.includes("error")
+      ) {
+
+        setStatus(
+          "接口错误：" +
+          (
+            data.error?.message ||
+            data.message ||
+            "未知错误"
+          )
+        );
+
+      }
+
+    };
+
+
+    /*
+      打开手机麦克风
+    */
+
+    localStream =
+      await navigator.mediaDevices
+        .getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+
+    localStream
+      .getTracks()
+      .forEach(track => {
+
+        pc.addTrack(
+          track,
+          localStream
+        );
+
+      });
+
+
+    /*
+      创建 WebRTC Offer
+    */
+
+    const offer =
+      await pc.createOffer();
+
+    await pc.setLocalDescription(
+      offer
+    );
+
+
+    /*
+      使用临时 Client Secret
+      建立 OpenAI Realtime Translation
+    */
+
+    const rtcResponse =
+      await fetch(
+        "https://api.openai.com/v1/realtime/translations/calls",
+        {
+          method: "POST",
+
+          headers: {
+            "Authorization":
+              "Bearer " + token,
+
+            "Content-Type":
+              "application/sdp"
+          },
+
+          body: offer.sdp
+        }
+      );
+
+
+    if (!rtcResponse.ok) {
+
+      const message =
+        await rtcResponse.text();
+
+      throw new Error(message);
+
+    }
+
+
+    const answer =
+      await rtcResponse.text();
+
+
+    await pc.setRemoteDescription({
+      type: "answer",
+      sdp: answer
+    });
+
+
+  } catch (error) {
+
+    setStatus(
+      "连接失败：" +
+      error.message
+    );
+
+    console.error(error);
+
+    if (localStream) {
+
+      localStream
+        .getTracks()
+        .forEach(track => track.stop());
+
+    }
+
+    pc = null;
+    dc = null;
+    localStream = null;
+
+    $("start").disabled = false;
+    $("stop").disabled = true;
+
+  }
+
+}
+
+
+$("start").onclick =
+  startTranslation;
+
+
+$("stop").onclick =
+  stopTranslation;
+
+
+/*
+  翻译语言改变时，
+  如果正在工作则重新建立连接
+*/
+
+$("lang").onchange = () => {
+
+  if (pc) {
+    startTranslation();
+  }
+
+};
+
+</script>
+
+</body>
+</html>
